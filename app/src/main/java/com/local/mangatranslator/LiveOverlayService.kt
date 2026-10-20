@@ -151,6 +151,10 @@ class LiveOverlayService : Service() {
         virtualDisplay = null
         imageReader?.close()
         imageReader = null
+        projectionCallback?.let { cb ->
+            runCatching { mediaProjection?.unregisterCallback(cb) }
+        }
+        projectionCallback = null
         mediaProjection?.stop()
         mediaProjection = null
     }
@@ -172,9 +176,10 @@ class LiveOverlayService : Service() {
         releaseProjectionResources()
 
         val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = mpManager.getMediaProjection(resultCode, resultData)
+        val projection = mpManager.getMediaProjection(resultCode, resultData)
+        mediaProjection = projection
 
-        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+        val callback = object : MediaProjection.Callback() {
             override fun onStop() {
                 virtualDisplay?.release()
                 virtualDisplay = null
@@ -182,7 +187,9 @@ class LiveOverlayService : Service() {
                 imageReader = null
                 stopSelf()
             }
-        }, Handler(Looper.getMainLooper()))
+        }
+        projectionCallback = callback
+        projection?.registerCallback(callback, Handler(Looper.getMainLooper()))
 
         val (realWidth, realHeight, densityDpi) = getRealScreenDimensions()
 
@@ -193,7 +200,7 @@ class LiveOverlayService : Service() {
             2
         )
 
-        virtualDisplay = mediaProjection?.createVirtualDisplay(
+        virtualDisplay = projection?.createVirtualDisplay(
             "MangaLiveCapture",
             realWidth,
             realHeight,
@@ -347,22 +354,32 @@ class LiveOverlayService : Service() {
                 controlPillLayout?.visibility = View.INVISIBLE
                 delay(85L)
 
-                val bitmap = acquireScreenBitmap()
+                var bitmap = acquireScreenBitmap()
+                if (bitmap == null && force) {
+                    repeat(3) {
+                        if (bitmap == null) {
+                            delay(45L)
+                            bitmap = acquireScreenBitmap()
+                        }
+                    }
+                }
+
                 overlayCanvasView?.visibility = View.VISIBLE
                 controlPillLayout?.visibility = View.VISIBLE
 
-                if (bitmap != null) {
+                val captured = bitmap
+                if (captured != null) {
                     try {
-                        val signature = computeFastFrameSignature(bitmap)
+                        val signature = computeFastFrameSignature(captured)
                         val hasPageChanged = abs(signature - lastFrameSignature) > 1800L
 
                         if (force || hasPageChanged) {
                             lastFrameSignature = signature
-                            val bubbles = engine.processScreenFrame(bitmap)
+                            val bubbles = engine.processScreenFrame(captured)
                             overlayCanvasParams?.let { updateOverlayBubbles(bubbles, it) }
                         }
                     } finally {
-                        bitmap.recycle()
+                        captured.recycle()
                     }
                 }
             } finally {
