@@ -59,6 +59,7 @@ class LiveOverlayService : Service() {
     private lateinit var engine: MangaTranslationEngine
 
     private var mediaProjection: MediaProjection? = null
+    private var projectionCallback: MediaProjection.Callback? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
 
@@ -108,7 +109,6 @@ class LiveOverlayService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // Dynamically resize capture surface when user rotates screen for double-page manga spreads
         if (mediaProjection != null && virtualDisplay != null) {
             val (realWidth, realHeight, densityDpi) = getRealScreenDimensions()
             imageReader?.close()
@@ -468,11 +468,6 @@ class LiveOverlayService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 }
 
-/**
- * Custom Overlay View that auto-expands narrow 1-column vertical Manga boxes
- * so horizontal English translations never wrap every 2 letters, and stores drawn
- * bounds so tapping any part of a rendered card speaks the original Japanese.
- */
 class MangaOverlayView(
     context: Context,
     private val onBubbleTapped: (MangaBubble) -> Unit,
@@ -534,7 +529,6 @@ class MangaOverlayView(
             )
             rectF.inset(-10f, -10f)
 
-            // Expand narrow 1-column vertical Japanese boxes to at least 220px wide
             val minReadableWidth = 220f
             if (rectF.width() < minReadableWidth) {
                 val cx = rectF.centerX()
@@ -573,7 +567,6 @@ class MangaOverlayView(
                 currentTextSize -= 2f
             } while (staticLayout.height > targetHeight && currentTextSize >= 18f)
 
-            // Ensure card bottom always fits the full translated English text
             val requiredHeight = staticLayout.height + 42f
             if (rectF.height() < requiredHeight) {
                 rectF.bottom = rectF.top + requiredHeight
