@@ -86,7 +86,6 @@ class MangaTranslationEngine private constructor(private val appContext: Context
                 isTtsReady = result != TextToSpeech.LANG_MISSING_DATA &&
                         result != TextToSpeech.LANG_NOT_SUPPORTED
 
-                // Bind directly to an installed offline Japanese voice (no internet required)
                 val offlineJapaneseVoice = engine.voices?.firstOrNull { voice ->
                     voice.locale.language == Locale.JAPAN.language && !voice.isNetworkConnectionRequired
                 }
@@ -98,10 +97,6 @@ class MangaTranslationEngine private constructor(private val appContext: Context
         }
     }
 
-    /**
-     * Checks the app's local storage folder for a heavy MediaPipe LLM (.task or .bin)
-     * on Dispatchers.IO so the UI thread never blocks.
-     */
     suspend fun initHeavyLocalLlmIfPresent(): String = withContext(Dispatchers.IO) {
         llmMutex.withLock {
             val modelDir = appContext.getExternalFilesDir(null) ?: appContext.filesDir
@@ -151,9 +146,6 @@ class MangaTranslationEngine private constructor(private val appContext: Context
         }
     }
 
-    /**
-     * Speaks the ORIGINAL Japanese text aloud using the bound offline voice.
-     */
     fun speakOriginalJapanese(japaneseText: String) {
         if (!isTtsReady) return
         val cleanText = japaneseText.replace("\n", " ").trim()
@@ -177,20 +169,16 @@ class MangaTranslationEngine private constructor(private val appContext: Context
         if (rawLines.isEmpty()) return@withContext emptyList()
 
         val clusteredBubbles = clusterAndSortMangaBubbles(rawLines)
-        val results = mutableListOf<MangaBubble>()
+        val translations = translateBubblesBatch(clusteredBubbles.map { it.japaneseText })
 
-        for (cluster in clusteredBubbles) {
-            val translated = translateJapaneseContextAware(cluster.japaneseText)
-            results.add(
-                MangaBubble(
-                    boundingBox = cluster.bounds,
-                    originalJapanese = cluster.japaneseText,
-                    translatedEnglish = translated,
-                    isVertical = cluster.isVertical
-                )
+        clusteredBubbles.mapIndexed { index, cluster ->
+            MangaBubble(
+                boundingBox = cluster.bounds,
+                originalJapanese = cluster.japaneseText,
+                translatedEnglish = translations.getOrElse(index) { "" },
+                isVertical = cluster.isVertical
             )
         }
-        results
     }
 
     private data class BubbleCluster(
@@ -224,14 +212,12 @@ class MangaTranslationEngine private constructor(private val appContext: Context
                 }
             } while (merged)
 
-            // Determine if this speech bubble is vertical (Tategaki)
             val verticalCount = group.count { line ->
                 val b = line.boundingBox!!
                 b.height() > b.width() * 1.15f && line.text.trim().length >= 2
             }
             val isVertical = verticalCount * 2 >= group.size
 
-            // Filter narrow Furigana columns in multi-column vertical speech bubbles
             val filteredGroup = if (isVertical && group.size >= 2) {
                 val widths = group.map { it.boundingBox!!.width() }.sorted()
                 val medianWidth = widths[widths.size / 2]
@@ -249,34 +235,31 @@ class MangaTranslationEngine private constructor(private val appContext: Context
                 group
             }
 
-            // 2D Reading Order Sort:
-            // Handles both multi-column Tategaki AND columns split into top/bottom segments by OCR
+            // Transitive bucket-based 2D sort (prevents TimSort IllegalArgumentException)
             val sortedLines = if (isVertical) {
-                filteredGroup.sortedWith { a, b ->
-                    val boxA = a.boundingBox!!
-                    val boxB = b.boundingBox!!
-                    val sameColumnThreshold = (min(boxA.width(), boxB.width()) * 0.6f).toInt().coerceAtLeast(12)
-                    if (abs(boxA.centerX() - boxB.centerX()) <= sameColumnThreshold) {
-                        // Same vertical column -> Read Top-to-Bottom
-                        boxA.top.compareTo(boxB.top)
-                    } else {
-                        // Different vertical columns -> Read Right-to-Left
-                        boxB.centerX().compareTo(boxA.centerX())
+                val columns = mutableListOf<MutableList<Text.Line>>()
+                for (line in filteredGroup.sortedByDescending { it.boundingBox!!.centerX() }) {
+                    val box = line.boundingBox!!
+                    val matchingCol = columns.firstOrNull { col ->
+                        val refBox = col.first().boundingBox!!
+                        val threshold = (min(box.width(), refBox.width()) * 0.6f).toInt().coerceAtLeast(12)
+                        abs(box.centerX() - refBox.centerX()) <= threshold
                     }
+                    if (matchingCol != null) matchingCol.add(line) else columns.add(mutableListOf(line))
                 }
+                columns.flatMap { col -> col.sortedBy { it.boundingBox!!.top } }
             } else {
-                filteredGroup.sortedWith { a, b ->
-                    val boxA = a.boundingBox!!
-                    val boxB = b.boundingBox!!
-                    val sameRowThreshold = (min(boxA.height(), boxB.height()) * 0.6f).toInt().coerceAtLeast(12)
-                    if (abs(boxA.centerY() - boxB.centerY()) <= sameRowThreshold) {
-                        // Same horizontal row -> Read Left-to-Right
-                        boxA.left.compareTo(boxB.left)
-                    } else {
-                        // Different horizontal rows -> Read Top-to-Bottom
-                        boxA.centerY().compareTo(boxB.centerY())
+                val rows = mutableListOf<MutableList<Text.Line>>()
+                for (line in filteredGroup.sortedBy { it.boundingBox!!.centerY() }) {
+                    val box = line.boundingBox!!
+                    val matchingRow = rows.firstOrNull { row ->
+                        val refBox = row.first().boundingBox!!
+                        val threshold = (min(box.height(), refBox.height()) * 0.6f).toInt().coerceAtLeast(12)
+                        abs(box.centerY() - refBox.centerY()) <= threshold
                     }
+                    if (matchingRow != null) matchingRow.add(line) else rows.add(mutableListOf(line))
                 }
+                rows.flatMap { row -> row.sortedBy { it.boundingBox!!.left } }
             }
 
             val combinedJapanese = sortedLines.joinToString(separator = "") { it.text.trim() }
@@ -285,15 +268,17 @@ class MangaTranslationEngine private constructor(private val appContext: Context
             }
         }
 
-        // Order speech bubbles in Manga page order (Top-to-Bottom, Right-to-Left)
-        return clusters.sortedWith { a, b ->
-            val yDiff = a.bounds.centerY() - b.bounds.centerY()
-            if (abs(yDiff) > max(a.bounds.height(), b.bounds.height()) / 2) {
-                yDiff
-            } else {
-                b.bounds.centerX() - a.bounds.centerX()
+        // Group bubbles into horizontal bands first, then sort bands top-to-bottom and right-to-left
+        val bands = mutableListOf<MutableList<BubbleCluster>>()
+        for (cluster in clusters.sortedBy { it.bounds.centerY() }) {
+            val matchingBand = bands.firstOrNull { band ->
+                val ref = band.first()
+                abs(cluster.bounds.centerY() - ref.bounds.centerY()) <=
+                        max(cluster.bounds.height(), ref.bounds.height()) / 2
             }
+            if (matchingBand != null) matchingBand.add(cluster) else bands.add(mutableListOf(cluster))
         }
+        return bands.flatMap { band -> band.sortedByDescending { it.bounds.centerX() } }
     }
 
     private fun areLinesInSameSpeechBubble(clusterRect: Rect, lineRect: Rect): Boolean {
@@ -334,30 +319,41 @@ class MangaTranslationEngine private constructor(private val appContext: Context
         }
     }
 
-    private suspend fun translateJapaneseContextAware(japaneseText: String): String =
+    private suspend fun translateBubblesBatch(japaneseTexts: List<String>): List<String> =
         withContext(Dispatchers.IO) {
+            if (japaneseTexts.isEmpty()) return@withContext emptyList()
+
             llmMutex.withLock {
                 val llm = localLlm
                 if (llm != null) {
                     try {
-                        val prompt = """
-                            <start_of_turn>user
-                            You are an expert Japanese-to-English manga translator. Translate the following Japanese dialogue into natural, accurate English. Output ONLY the English translation without explanations or quotes:
-                            $japaneseText<end_of_turn>
-                            <start_of_turn>model
-                        """.trimIndent()
+                        val numberedInput = japaneseTexts.mapIndexed { i, text -> "${i + 1}. $text" }
+                            .joinToString("\n")
+                        val prompt = "<start_of_turn>user\n" +
+                            "You are an expert Japanese-to-English manga translator. Translate each numbered Japanese line below into natural, accurate English. Keep the exact numbering (1., 2., etc.) and output ONLY the numbered translations:\n" +
+                            "$numberedInput<end_of_turn>\n" +
+                            "<start_of_turn>model\n"
                         val response = llm.generateResponse(prompt).trim()
-                        if (response.isNotEmpty()) return@withContext response
+                        val lineRegex = Regex("""^\d+[\.\)]\s*(.+)$""")
+                        val parsed = response.lines()
+                            .mapNotNull { line ->
+                                lineRegex.find(line.trim())?.groupValues?.get(1)?.trim()
+                            }
+                        if (parsed.size == japaneseTexts.size) {
+                            return@withContext parsed
+                        }
                     } catch (_: Throwable) {
                         // Fall through to offline NMT fallback
                     }
                 }
             }
 
-            return@withContext try {
-                nmtTranslator.translate(japaneseText).await()
-            } catch (e: Exception) {
-                "[Offline Model Needed: Connect once to download 30MB NMT]"
+            japaneseTexts.map { text ->
+                try {
+                    nmtTranslator.translate(text).await()
+                } catch (_: Exception) {
+                    "[Offline Model Needed: Connect once to download 30MB NMT]"
+                }
             }
         }
 }
